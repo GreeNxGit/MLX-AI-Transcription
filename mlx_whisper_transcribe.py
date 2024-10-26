@@ -272,7 +272,7 @@ def process_video(input_file, model_name, language):
 def main():
     st.set_page_config(page_title="Auto Subtitled Video Generator", page_icon=":movie_camera:", layout="wide")
     render_header()
-    input_file = st.file_uploader("Upload Video File", type=["mp4", "avi", "mov", "mkv"])
+    input_file = st.file_uploader("Upload Video File", type=["mp4", "avi", "mov", "mkv", "mp3"])
     model_name, is_language_locked = render_model_selection()
    
     if is_language_locked:
