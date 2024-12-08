@@ -1,3 +1,9 @@
 pages/local_video*
 local_video*
+local_audio*
+.idea/
+.ai/
+.venv/
+.github/
+.streamlit/
 __pycache__
