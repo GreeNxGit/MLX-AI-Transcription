@@ -1,26 +1,17 @@
-import tempfile
-import zipfile
-
-import streamlit as st
-from streamlit_lottie import st_lottie
-import mlx.core as mx
-import mlx_whisper
-import requests
-from pytube import YouTube
-import pathlib
-import os
 import base64
 import logging
-from zipfile import ZipFile
+import os
+import pathlib
 import subprocess
+import zipfile
+from typing import Dict, Any
+
+import mlx.core as mx
+import mlx_whisper
 import numpy as np
-import re
-from typing import List, Dict, Any
-
-from mlx_whisper_transcribe import create_download_link, write_subtitles, write_text_transcription, \
-    render_model_selection, LANGUAGES, prepare_audio, process_audio
-
-from typing import Tuple
+import streamlit as st
+import yt_dlp
+from pytube import YouTube
 
 # Set up logging for debug information
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -29,23 +20,30 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 SAVE_DIR = pathlib.Path(__file__).parent.absolute() / "local_audio"
 SAVE_DIR.mkdir(exist_ok=True)
 
-
-# Function to download and convert YouTube video
-def download_and_convert_youtube_audio(youtube_url: str) -> str:
-    """Download audio from a YouTube video and convert it to WAV format."""
-    try:
-        yt = YouTube(youtube_url)
-        audio_stream = yt.streams.filter(only_audio=True).first()
-        download_path = audio_stream.download(output_path=str(SAVE_DIR), filename="youtube_audio")
-
-        # Convert to WAV
-        output_path = os.path.join(SAVE_DIR, "youtube_audio.wav")
-        convert_to_wav(download_path, output_path)
-        return output_path
-    except Exception as e:
-        logging.error(f"Failed to download and convert YouTube audio: {e}")
-        return None
-
+LANGUAGES = {
+    "Detect automatically": None,
+    "English": "en",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Italian": "it",
+    "Portuguese": "pt",
+    "Dutch": "nl",
+    "Russian": "ru",
+    "Chinese": "zh",
+    "Japanese": "ja",
+    "Korean": "ko"
+}
+# Constants
+DEVICE = "mps" if mx.metal.is_available() else "cpu"
+MODELS = {
+    "Tiny (Q4)": "mlx-community/whisper-tiny-mlx-q4",
+    "Large v3": "mlx-community/whisper-large-v3-mlx",
+    "Small English (Q4)": "mlx-community/whisper-small.en-mlx-q4",
+    "Small (FP32)": "mlx-community/whisper-small-mlx-fp32",
+    "Distil Large v3 (English)": "mlx-community/distil-whisper-large-v3",
+    "Large v3 Turbo": "mlx-community/whisper-large-v3-turbo"
+}
 
 # Convert to WAV format using ffmpeg
 def convert_to_wav(input_file: str, output_file: str):
@@ -54,46 +52,84 @@ def convert_to_wav(input_file: str, output_file: str):
     subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     logging.info(f"File converted to WAV: {output_file}")
 
+# Function to download and convert YouTube video
+def download_and_convert_youtube_audio_old(youtube_url: str) -> str:
+    """Download audio from a YouTube video and convert it to WAV format."""
+    try:
+        yt = YouTube(youtube_url)
+        audio_stream = yt.streams.filter(only_audio=True).first()
+        video_title = yt.title.replace(" ", "_")  # Use video title as base name
+        download_path = audio_stream.download(output_path=str(SAVE_DIR), filename=f"{video_title}_audio")
+
+        # Convert to WAV
+        output_path = os.path.join(SAVE_DIR, f"{video_title}.wav")
+        convert_to_wav(download_path, output_path)
+        return output_path
+    except Exception as e:
+        logging.error(f"Failed to download and convert YouTube audio: {e}")
+        return None
+
+def download_and_convert_youtube_audio(youtube_url: str) -> str:
+    """Download audio from a YouTube video and convert it to WAV format using yt-dlp."""
+    try:
+        # Use YouTube video title as base name
+        temp_audio_path = SAVE_DIR / "temp_audio"
+        temp_audio_path.mkdir(parents=True, exist_ok=True)
+        # Use YouTube video title as base name
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": str(SAVE_DIR / "%(title)s.%(ext)s"),
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "wav",
+                "preferredquality": "192",
+            }],
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=True)
+            downloaded_path = temp_audio_path / f"{info['title']}.{info['ext']}"
+
+            # Convert the downloaded audio to WAV using convert_to_wav
+            output_path = SAVE_DIR / f"{info['title'].replace(' ', '_')}.wav"
+            convert_to_wav(str(downloaded_path), str(output_path))
+
+            # Clean up temporary file
+            if downloaded_path.exists():
+                os.remove(downloaded_path)
+
+            logging.info(f"Audio downloaded and converted to WAV: {output_path}")
+            return str(output_path)
+
+    except Exception as e:
+        logging.error(f"Failed to download and convert YouTube audio: {e}")
+        return None
 
 # Handle uploaded files and convert them to a compatible format
 def process_uploaded_file(uploaded_file) -> str:
     """Convert an uploaded file to WAV format for further processing."""
+    base_name = os.path.splitext(uploaded_file.name)[0].replace(" ", "_")  # Use uploaded file name as base name
     temp_input_path = os.path.join(SAVE_DIR, uploaded_file.name)
     with open(temp_input_path, "wb") as f:
         f.write(uploaded_file.read())
 
     # Convert to WAV for standard processing
-    temp_output_path = os.path.join(SAVE_DIR, "converted_audio.wav")
+    temp_output_path = os.path.join(SAVE_DIR, f"{base_name}.wav")
     convert_to_wav(temp_input_path, temp_output_path)
     return temp_output_path
 
 
-# Main processing function
-def process_audio_file(audio_file_path: str, model_path: str, language: str = None):
-    """Prepare and process the WAV audio file using mlx_whisper."""
-    try:
-        # Prepare audio data for whisper (customize based on your library requirements)
-        audio_data = prepare_audio(audio_file_path)
-        results = process_audio(model_path, audio_data, task="transcribe", language=language)
-
-        # Handle results (save to text file, create download link, etc.)
-        handle_results(results)
-    except Exception as e:
-        logging.error(f"An error occurred during audio processing: {e}")
-        st.error("An error occurred during audio processing. Check the logs for details.")
-
-
 # Function to save results and create a download link
-def handle_results(results: dict):
+def handle_results(results: dict, base_name: str):
     """
     Save transcription results to text, SRT, and VTT files,
     then create a zip archive and generate a download link.
     """
     # Define file paths
-    text_path = SAVE_DIR / "transcript.txt"
-    srt_path = SAVE_DIR / "transcript.srt"
-    vtt_path = SAVE_DIR / "transcript.vtt"
-    zip_path = SAVE_DIR / "transcripts.zip"
+    text_path = SAVE_DIR / f"{base_name}.txt"
+    srt_path = SAVE_DIR / f"{base_name}.srt"
+    vtt_path = SAVE_DIR / f"{base_name}.vtt"
+    zip_path = SAVE_DIR / f"{base_name}_transcripts.zip"
 
     # Write text transcription
     with open(text_path, "w") as text_file:
@@ -110,7 +146,52 @@ def handle_results(results: dict):
         zipf.write(vtt_path, os.path.basename(vtt_path))
 
     # Provide download link in Streamlit
-    st.markdown(create_download_link(zip_path, "Download Transcripts"), unsafe_allow_html=True)
+    st.markdown(create_download_link(zip_path, "Download Transcripts", base_name), unsafe_allow_html=True)
+
+
+def process_audio(model_path: str, audio: mx.array, task: str, language: str = None) -> Dict[str, Any]:
+    logging.info(f"Processing audio with model: {model_path}, task: {task}, language: {language}")
+    try:
+        decode_options = {"language": language} if language else {}
+
+        if task.lower() == "transcribe":
+            results = mlx_whisper.transcribe(
+                audio, path_or_hf_repo=model_path, fp16=False, verbose=True, word_timestamps=True, **decode_options
+            )
+            logging.info(f"{task.capitalize()} completed successfully")
+            return results
+        else:
+            raise ValueError(f"Unsupported task: {task}")
+    except Exception as e:
+        logging.error(f"Unexpected error in mlx_whisper.{task}: {e}")
+        raise
+
+def prepare_audio(audio_path: str) -> mx.array:
+    command = [
+        "ffmpeg", "-i", audio_path, "-f", "s16le", "-acodec", "pcm_s16le",
+        "-ar", "16000", "-ac", "1", "-"
+    ]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    audio_data, _ = process.communicate()
+    audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+    return mx.array(audio_array)
+
+# Update `process_audio_file` to include the base name
+def process_audio_file(audio_file_path: str, model_path: str, language: str = None):
+    """Prepare and process the WAV audio file using mlx_whisper."""
+    try:
+        # Extract base name from audio file
+        base_name = os.path.splitext(os.path.basename(audio_file_path))[0]
+
+        # Prepare audio data for whisper (customize based on your library requirements)
+        audio_data = prepare_audio(audio_file_path)
+        results = process_audio(model_path, audio_data, task="transcribe", language=language)
+
+        # Handle results (save to text file, create download link, etc.)
+        handle_results(results, base_name)
+    except Exception as e:
+        logging.error(f"An error occurred during audio processing: {e}")
+        st.error("An error occurred during audio processing. Check the logs for details.")
 
 
 # Helper functions for subtitle and download link creation
@@ -144,15 +225,43 @@ def format_timestamp(seconds: float, format: str) -> str:
         return f"{hours:02}:{minutes:02}:{seconds:06.3f}"
 
 
-def create_download_link(file_path: str, link_text: str) -> str:
+def create_download_link(file_path: str, link_text: str, base_name: str) -> str:
     """
     Create a download link for the given file path in Streamlit.
     """
     with open(file_path, "rb") as f:
         data = f.read()
     b64 = base64.b64encode(data).decode()  # Convert file to base64
-    href = f'<a href="data:application/zip;base64,{b64}" download="transcripts.zip">{link_text}</a>'
+    href = f'<a href="data:application/zip;base64,{b64}" download="{base_name}_transcripts.zip">{link_text}</a>'
     return href
+
+
+def render_model_selection():
+    selected_model = st.selectbox("Select Whisper Model", list(MODELS.keys()), index=4)
+    if selected_model == "Distil Large v3 (English)":
+        st.info("""
+        **Distil Large v3 Model**
+
+        This new model offers significant performance improvements:
+        - Runs approximately 40 times faster than real-time on M1 Max chips
+        - Can transcribe 12 minutes of audio in just 18 seconds
+        - Provides a great balance between speed and accuracy
+
+        Ideal for processing longer videos or when you need quick results without sacrificing too much accuracy.
+        """)
+    if selected_model == "Large v3 Turbo":
+        st.info("""
+        **Large v3 Turbo**
+
+        This new model offers significant performance improvements:
+        - Transcribes 12 minutes in 14 seconds on an M2 Ultra (~50X faster than real time)
+        - Significantly smaller than the Large v3 model (809M vs 1550M)
+        - It is multilingual
+        """)
+    if selected_model in ["Small English (Q4)", "Distil Large v3 (English)"]:
+        return MODELS[selected_model], True
+    else:
+        return MODELS[selected_model], False
 
 # Streamlit UI for upload or YouTube URL
 def main():

@@ -5,3 +5,4 @@ mlx-whisper
 requests
 numpy
 pytube
+yt_dlp
